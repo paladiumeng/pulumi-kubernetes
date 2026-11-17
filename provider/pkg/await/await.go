@@ -740,6 +740,7 @@ func handleSSAIgnoreFields(c *UpdateConfig, liveOldObj *unstructured.Unstructure
 	// Add all parent paths of the fields to the set.
 	theirFields = ensureFieldsAreMembers(theirFields)
 	ourFields = ensureFieldsAreMembers(ourFields)
+	allFields := theirFields.Union(ourFields)
 
 	for _, ignorePath := range c.IgnoreChanges {
 		ipParsed, err := resource.ParsePropertyPath(ignorePath)
@@ -749,56 +750,54 @@ func handleSSAIgnoreFields(c *UpdateConfig, liveOldObj *unstructured.Unstructure
 			return fmt.Errorf("unable to parse ignoreField path %q: %w", ignorePath, err)
 		}
 
-		// TODO: Enhance support for ignoreField path to support nested arrays.
-		pathComponents := strings.Split(ipParsed.String(), ".")
-		pe, err := fieldpath.MakePath(makeInterfaceSlice(pathComponents)...)
-		if err != nil {
-			return fmt.Errorf("unable to normalize ignoreField path %q: %w", ignorePath, err)
-		}
+		// A path can name more than one location, when it has a wildcard, and
+		// a list item has another address in the managed fields than in the
+		// path. See resolveIgnoreTargets.
+		targets := resolveIgnoreTargets(ipParsed, c.Inputs.Object, liveOldObj.Object, allFields)
 
-		// Drop the field from the inputs if it is present on the cluster and
-		// managed by another manager, and is not shared with current manager.
-		// This ensures that we don't get any conflict errors, or mistakenly
-		// setting the current field manager as a shared manager of that field.
-		if theirFields.Has(pe) && !ourFields.Has(pe) {
-			unstructured.RemoveNestedField(c.Inputs.Object, pathComponents...)
-			continue
-		}
+		// Go from the last target to the first, so that removing a list item
+		// does not move an item that an earlier target names.
+		for i := len(targets) - 1; i >= 0; i-- {
+			target := targets[i]
 
-		// We didn't find another field manager that is managing this field, so
-		// we need to use the last known value applied to the cluster so we
-		// don't unset it or change it to a different value that is not the
-		// last known value. This case handles 2 posibilities:
-		//
-		// 1. The field is managed by the current field manager, or is a shared
-		// manager, in this case the field needs to be in the request sent to
-		// the server, otherwise it will be unset.
-		// 2. The field is set/exists on the cluster, but for some reason is
-		// not listed in the managed fields, in this case we need to set the
-		// field to the last known value applied to the cluster, otherwise it
-		// will be unset. This would cause the current field manager to take
-		// ownership of the field, but this edge case probably shouldn't be hit
-		// in practice.
-		//
-		// NOTE: If the field has been reverted to its default value,
-		// ignoreChanges will still not update this field to what is supplied
-		// by the user in their Pulumi program.
-		lastLiveVal, found, err := unstructured.NestedFieldCopy(liveOldObj.Object, pathComponents...)
-		if found && err == nil {
-			// We only care if the field is found, as not found indicates that
-			// the field does not exist in the live state so we don't have to
-			// worry about changing the inputs to match the live state. If this
-			// occurs, then Pulumi will set the field back to the declared
-			// value as ignoreChanges will use the declared value if one is not
-			// found in state as per the intent of ignoreChanges.
-			err := unstructured.SetNestedField(c.Inputs.Object, lastLiveVal, pathComponents...)
-			if err != nil {
-				return fmt.Errorf("unable to set field %q with last used value %q: %w", ignorePath, lastLiveVal, err)
+			// Drop the field from the inputs if it is present on the cluster and
+			// managed by another manager, and is not shared with current manager.
+			// This ensures that we don't get any conflict errors, or mistakenly
+			// setting the current field manager as a shared manager of that field.
+			if theirFields.Has(target.managed) && !ourFields.Has(target.managed) {
+				removeNestedValue(c.Inputs.Object, target.inputs)
+				continue
 			}
-		}
-		if err != nil {
-			// A type error occurred when attempting to get the nested field from the live object.
-			return fmt.Errorf("unable to parse field to ignore %q from live object: %w", ignorePath, err)
+
+			// We didn't find another field manager that is managing this field, so
+			// we need to use the last known value applied to the cluster so we
+			// don't unset it or change it to a different value that is not the
+			// last known value. This case handles 2 posibilities:
+			//
+			// 1. The field is managed by the current field manager, or is a shared
+			// manager, in this case the field needs to be in the request sent to
+			// the server, otherwise it will be unset.
+			// 2. The field is set/exists on the cluster, but for some reason is
+			// not listed in the managed fields, in this case we need to set the
+			// field to the last known value applied to the cluster, otherwise it
+			// will be unset. This would cause the current field manager to take
+			// ownership of the field, but this edge case probably shouldn't be hit
+			// in practice.
+			//
+			// NOTE: If the field has been reverted to its default value,
+			// ignoreChanges will still not update this field to what is supplied
+			// by the user in their Pulumi program.
+			if !target.liveFound {
+				// The field does not exist in the live state, so we don't have to
+				// worry about changing the inputs to match the live state. If this
+				// occurs, then Pulumi will set the field back to the declared
+				// value as ignoreChanges will use the declared value if one is not
+				// found in state as per the intent of ignoreChanges.
+				continue
+			}
+			if lastLiveVal, found := nestedValue(liveOldObj.Object, target.live); found {
+				setNestedValue(c.Inputs.Object, target.inputs, lastLiveVal)
+			}
 		}
 	}
 
