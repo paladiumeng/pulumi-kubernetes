@@ -1,0 +1,61 @@
+# Builds the patched provider that paladiumeng/iac uses, and publishes it as a release.
+#
+# This branch is the upstream tag in its name plus one fix: ignoreChanges paths that go through a
+# list (provider/pkg/await/ignore_changes.go). The upstream workflows are removed here, because
+# they need the secrets of pulumi/pulumi-kubernetes.
+#
+# To release: push a tag `v<upstream version>-pax.<n>` on this branch, such as v4.33.0-pax.1.
+# Pulumi finds an archive by the name pulumi-resource-kubernetes-<tag>-<os>-<arch>.tar.gz.
+name: Release the patched provider
+
+on:
+  push:
+    tags:
+      - "v*-pax.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      # The runner's Go downloads the toolchain that provider/go.mod names.
+      - name: Test the fix
+        working-directory: provider
+        run: go test ./pkg/await/ -count=1
+
+      - name: Build the archives
+        working-directory: provider
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          VERSION="$version" go generate cmd/pulumi-resource-kubernetes/main.go
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            out="$RUNNER_TEMP/$os-$arch"
+            mkdir -p "$out"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -o "$out/pulumi-resource-kubernetes" \
+              -ldflags "-s -w -X github.com/pulumi/pulumi-kubernetes/provider/v4/pkg/version.Version=$version" \
+              ./cmd/pulumi-resource-kubernetes
+            tar -czf "$GITHUB_WORKSPACE/dist/pulumi-resource-kubernetes-v$version-$os-$arch.tar.gz" \
+              -C "$out" pulumi-resource-kubernetes
+          done
+          (cd "$GITHUB_WORKSPACE/dist" && sha256sum ./*.tar.gz | tee SHA256SUMS)
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --prerelease \
+            --notes "Upstream ${GITHUB_REF_NAME%-pax.*} plus the fix for ignoreChanges paths that go through a list. Built for paladiumeng/iac."
